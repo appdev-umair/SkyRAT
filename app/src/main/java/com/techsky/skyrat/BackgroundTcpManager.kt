@@ -243,14 +243,10 @@ class BackgroundTcpManager(private val context: Context) {
                     downloadFile(filePath, socket)
                 }
 
-                command.startsWith("upload") -> {
-                    val parts = command.substringAfter("upload").trim().split(" ", limit = 2)
-                    if (parts.size == 2) {
-                        val result = uploadFile(parts[0], parts[1])
-                        sendResponse(result, socket)
-                    } else {
-                        sendResponse("Usage: upload <filename> <base64_data>", socket)
-                    }
+                command.startsWith("upload ") -> {
+                    val result = handleUpload(command, socket);
+                    sendResponse(result, socket)
+
                 }
 
                 command.startsWith("delete") -> {
@@ -582,51 +578,133 @@ class BackgroundTcpManager(private val context: Context) {
         }
     }
 
+// SIMPLIFIED: Single-message download in BackgroundTcpManager.kt
+
     private suspend fun downloadFile(filePath: String, socket: Socket) {
         try {
-            val file = File(filePath)
+            Log.d(TAG, "Download request for: $filePath")
+
+            // Handle relative vs absolute paths
+            val file = if (filePath.startsWith("/")) {
+                File(filePath)
+            } else {
+                File(currentDirectory, filePath)
+            }
+
+            Log.d(TAG, "Resolved file path: ${file.absolutePath}")
+
             if (!file.exists()) {
-                sendResponse("File not found: $filePath", socket)
+                sendResponse("ERROR: File not found: ${file.absolutePath}", socket)
                 return
             }
 
             if (!file.isFile) {
-                sendResponse("Not a file: $filePath", socket)
+                sendResponse("ERROR: Not a file: ${file.absolutePath}", socket)
                 return
             }
 
             if (file.length() > MAX_FILE_SIZE) {
-                sendResponse("File too large (max ${MAX_FILE_SIZE / 1024 / 1024}MB): ${formatFileSize(file.length())}", socket)
+                sendResponse("ERROR: File too large (max ${MAX_FILE_SIZE / 1024 / 1024}MB): ${formatFileSize(file.length())}", socket)
                 return
             }
 
+            Log.d(TAG, "Reading file: ${file.name}, size: ${file.length()}")
             val fileData = file.readBytes()
             val encodedData = Base64.encodeToString(fileData, Base64.DEFAULT)
 
-            sendResponse("DOWNLOAD_START", socket)
-            sendResponse("Filename: ${file.name}", socket)
-            sendResponse("Size: ${file.length()}", socket)
-            sendResponse("Data: $encodedData", socket)
-            sendResponse("DOWNLOAD_END", socket)
+            // SIMPLIFIED: Send everything in one message with getFile prefix
+            val fileName = file.nameWithoutExtension
+            val fileExtension = file.extension.ifEmpty { "bin" }
+            val downloadResponse = "getFile\n$fileName|_|$fileExtension|_|$encodedData"
+
+            withContext(Dispatchers.IO) {
+                outputStream.write(downloadResponse.toByteArray(Charsets.UTF_8))
+                outputStream.write("END123\n".toByteArray(Charsets.UTF_8))
+                outputStream.flush()
+            }
+
+            Log.d(TAG, "Download sent successfully: ${file.name}")
 
         } catch (e: Exception) {
-            sendResponse("Error downloading file: ${e.message}", socket)
+            Log.e(TAG, "Error downloading file: ${e.message}", e)
+            sendResponse("ERROR: Download failed: ${e.message}", socket)
         }
     }
+    // FIXED: Special response method for downloads (no END123 marker)
+    private suspend fun sendDownloadResponse(message: String, socket: Socket) {
+        try {
+            if (!isSocketAlive(socket)) {
+                Log.d(TAG, "Socket not alive, cannot send download response")
+                return
+            }
 
-    private fun uploadFile(filename: String, base64Data: String): String {
+            withContext(Dispatchers.IO) {
+                // Don't add END123 for download responses - server handles them differently
+                val fullMessage = message + if (!message.endsWith("\n")) "\n" else ""
+                outputStream.write(fullMessage.toByteArray(Charsets.UTF_8))
+                outputStream.flush()
+            }
+            Log.d(TAG, "Download response sent: ${message.take(50)}...")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error sending download response: ${e.message}")
+            Log.e(TAG, "Error sending download response: ${e.message}")
+        }
+    }
+    private fun handleUpload(command: String, socket: Socket): String {
         return try {
-            val file = File(currentDirectory, filename)
-            val fileData = Base64.decode(base64Data, Base64.DEFAULT)
+            Log.d(TAG, "Processing upload: $command")
 
-            file.writeBytes(fileData)
-            "File uploaded successfully: ${file.absolutePath} (${formatFileSize(file.length())})"
+            // Parse: "upload filename base64data"
+            val uploadData = command.removePrefix("upload ").trim()
+            val spaceIndex = uploadData.indexOf(' ')
 
+            if (spaceIndex == -1) return "ERROR: Usage: upload <filename> <base64data>"
+
+            val filename = uploadData.substring(0, spaceIndex).trim()
+            val base64Data = uploadData.substring(spaceIndex + 1).trim()
+
+            if (filename.isEmpty()) return "ERROR: Filename cannot be empty"
+            if (base64Data.isEmpty()) return "ERROR: No file data provided"
+
+            val cleanData = base64Data.replace("\\s".toRegex(), "")
+            val decodedBytes = Base64.decode(cleanData, Base64.DEFAULT)
+
+            // Save to user-accessible Downloads/uploaded_files/
+            val downloadDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "uploaded_files")
+            if (!downloadDir.exists()) downloadDir.mkdirs()
+
+            if (!downloadDir.canWrite()) return "ERROR: Cannot write to Downloads directory"
+
+            // Avoid filename conflicts
+            var finalFile = File(downloadDir, filename)
+            var counter = 1
+            while (finalFile.exists()) {
+                val name = filename.substringBeforeLast('.', filename)
+                val ext = if (filename.contains('.')) ".${filename.substringAfterLast('.')}" else ""
+                finalFile = File(downloadDir, "${name}_$counter$ext")
+                counter++
+            }
+
+            finalFile.writeBytes(decodedBytes)
+
+            val result = "SUCCESS: Uploaded ${finalFile.name} (${formatBytes(decodedBytes.size)}) to ${finalFile.absolutePath}"
+            Log.d(TAG, result)
+            result
+
+        } catch (e: IllegalArgumentException) {
+            "ERROR: Invalid file data (not valid base64)"
         } catch (e: Exception) {
-            "Error uploading file: ${e.message}"
+            Log.e(TAG, "Upload error: ${e.message}")
+            "ERROR: Upload failed - ${e.message}"
         }
     }
-
+    private fun formatBytes(bytes: Int): String {
+        return when {
+            bytes < 1024 -> "$bytes B"
+            bytes < 1024 * 1024 -> "${bytes / 1024} KB"
+            else -> "${bytes / (1024 * 1024)} MB"
+        }
+    }
     private fun deleteFile(filePath: String): String {
         return try {
             val file = File(filePath)
